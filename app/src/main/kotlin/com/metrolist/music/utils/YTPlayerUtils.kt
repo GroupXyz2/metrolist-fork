@@ -649,6 +649,86 @@ object YTPlayerUtils {
         return null
     }
 
+    /**
+     * Fetches an audio-only stream URL for the given videoId.
+     * Unlike [playerResponseForPlayback], this does NOT require [isOriginal] on audio formats,
+     * making it compatible with regular YouTube videos (anime openings, music videos, etc.).
+     * Uses Android clients that return direct URLs without signatureCipher.
+     */
+    suspend fun audioStreamUrlForVideo(videoId: String): String? = runCatching {
+        Timber.tag(logTag).d("Fetching audio stream URL for videoId: $videoId")
+        for (client in listOf(ANDROID_VR_1_61_48, ANDROID_VR_NO_AUTH, IOS)) {
+            val response = YouTube.player(videoId, null, client, null, null).getOrNull() ?: continue
+            if (response.playabilityStatus.status != "OK") {
+                Timber.tag(logTag).d("Audio player response not OK for ${client.clientName}: ${response.playabilityStatus.status}")
+                continue
+            }
+            // Pick highest-bitrate audio format regardless of isOriginal flag
+            val fmt = response.streamingData?.adaptiveFormats
+                ?.filter { it.isAudio }
+                ?.maxByOrNull { it.bitrate + if (it.mimeType.startsWith("audio/webm")) 10240 else 0 }
+            if (fmt == null) {
+                Timber.tag(logTag).d("No audio format found via ${client.clientName}")
+                continue
+            }
+            var url = findUrlOrNull(fmt, videoId, response, skipNewPipe = false)
+            if (url == null) {
+                Timber.tag(logTag).d("Could not resolve audio URL via ${client.clientName}")
+                continue
+            }
+            try {
+                val transformed = EjsNTransformSolver.transformNParamInUrl(url)
+                if (transformed != url) url = transformed
+            } catch (e: Exception) {
+                Timber.tag(logTag).d("Audio n-transform failed (non-fatal): ${e.message}")
+            }
+            Timber.tag(logTag).d("Audio stream URL resolved for $videoId via ${client.clientName}: mimeType=${fmt.mimeType}, bitrate=${fmt.bitrate}")
+            return@runCatching url
+        }
+        Timber.tag(logTag).d("All clients failed to produce an audio URL for $videoId")
+        null
+    }.onFailure { Timber.tag(logTag).e(it, "Failed to get audio stream URL for $videoId") }
+        .getOrNull()
+
+    /**
+     * Fetches a muxed (audio+video combined) stream URL for the given videoId.
+     * Muxed streams always contain an audio track, making them reliable for "original audio" mode.
+     * Falls back to audio-only stream if no muxed formats are available.
+     */
+    suspend fun muxedVideoUrlForPlayback(videoId: String): String? = runCatching {
+        Timber.tag(logTag).d("Fetching muxed video URL for videoId: $videoId")
+        for (client in listOf(ANDROID_VR_1_61_48, ANDROID_VR_NO_AUTH, IOS)) {
+            val response = YouTube.player(videoId, null, client, null, null).getOrNull() ?: continue
+            if (response.playabilityStatus.status != "OK") {
+                Timber.tag(logTag).d("Muxed player response not OK for ${client.clientName}: ${response.playabilityStatus.status}")
+                continue
+            }
+            // Prefer muxed formats (streamingData.formats) which contain both audio and video
+            val muxedFormats = response.streamingData?.formats
+                ?.filter { it.height != null && (it.height ?: 0) <= 720 }
+                ?: emptyList()
+            val fmt = muxedFormats.filter { it.mimeType.contains("avc1", ignoreCase = true) }.maxByOrNull { it.height ?: 0 }
+                ?: muxedFormats.maxByOrNull { it.height ?: 0 }
+            if (fmt == null) {
+                Timber.tag(logTag).d("No muxed format found via ${client.clientName}")
+                continue
+            }
+            var url = findUrlOrNull(fmt, videoId, response, skipNewPipe = false) ?: continue
+            try {
+                val transformed = EjsNTransformSolver.transformNParamInUrl(url)
+                if (transformed != url) url = transformed
+            } catch (e: Exception) {
+                Timber.tag(logTag).d("Muxed n-transform failed (non-fatal): ${e.message}")
+            }
+            Timber.tag(logTag).d("Muxed stream URL resolved for $videoId via ${client.clientName}: height=${fmt.height}, mimeType=${fmt.mimeType}")
+            return@runCatching url
+        }
+        // Fall back to adaptive audio-only stream
+        Timber.tag(logTag).d("No muxed format found, falling back to audio-only for $videoId")
+        audioStreamUrlForVideo(videoId)
+    }.onFailure { Timber.tag(logTag).e(it, "Failed to get muxed video URL for $videoId") }
+        .getOrNull()
+
     fun forceRefreshForVideo(videoId: String) {
         Timber.tag(logTag).d("Force refreshing for videoId: $videoId")
     }

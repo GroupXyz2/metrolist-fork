@@ -31,8 +31,11 @@ import androidx.compose.foundation.lazy.grid.LazyHorizontalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -81,6 +84,7 @@ import com.metrolist.music.LocalListenTogetherManager
 import com.metrolist.music.LocalPlayerConnection
 import com.metrolist.music.R
 import com.metrolist.music.constants.CropAlbumArtKey
+import com.metrolist.music.playback.VideoDownloadState
 import com.metrolist.music.constants.HidePlayerThumbnailKey
 import com.metrolist.music.constants.VideoOpeningModeKey
 import com.metrolist.music.constants.PlayerBackgroundStyle
@@ -210,6 +214,7 @@ fun Thumbnail(
     isPlayerExpanded: () -> Boolean = { true },
     isLandscape: Boolean = false,
     isListenTogetherGuest: Boolean = false,
+    onVideoTap: (() -> Unit)? = null,
 ) {
     val playerConnection = LocalPlayerConnection.current ?: return
     val context = LocalContext.current
@@ -222,6 +227,8 @@ fun Thumbnail(
     val canSkipPrevious by playerConnection.canSkipPrevious.collectAsState()
     val canSkipNext by playerConnection.canSkipNext.collectAsState()
     val videoModeEnabled by playerConnection.videoModeEnabled.collectAsState()
+    val videoDownloadState by playerConnection.videoDownloadState.collectAsState()
+    val videoOriginalAudioMode by playerConnection.videoOriginalAudioMode.collectAsState()
 
     // Preferences - computed once
     // Disable swipe for Listen Together guests
@@ -304,6 +311,7 @@ fun Thumbnail(
     // Seek effect state
     var showSeekEffect by remember { mutableStateOf(false) }
     var seekDirection by remember { mutableStateOf("") }
+    var showDeleteConfirmDialog by remember { mutableStateOf(false) }
 
     Box(
         modifier = modifier
@@ -446,6 +454,16 @@ fun Thumbnail(
                                     .clip(RoundedCornerShape(dimensions.cornerRadius))
                                     .background(Color.Black)
                             )
+                            // Transparent overlay to intercept taps for fullscreen toggle
+                            if (onVideoTap != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .pointerInput(onVideoTap) {
+                                            detectTapGestures { onVideoTap() }
+                                        }
+                                )
+                            }
                         }
                     } else {
                         LazyHorizontalGrid(
@@ -484,19 +502,67 @@ fun Thumbnail(
                         }
                     }
 
-                    // Floating video mode toggle button
-                    IconButton(
-                        onClick = { playerConnection.toggleVideoMode() },
+                    // Video mode toggle + download button stacked in the bottom-right corner
+                    Column(
                         modifier = Modifier
                             .align(Alignment.BottomEnd)
-                            .padding(end = PlayerHorizontalPadding, bottom = 8.dp)
+                            .padding(end = PlayerHorizontalPadding, bottom = 8.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Icon(
-                            painter = painterResource(R.drawable.slow_motion_video),
-                            contentDescription = stringResource(R.string.music_video),
-                            tint = if (videoModeEnabled) MaterialTheme.colorScheme.primary
-                                   else textBackgroundColor.copy(alpha = 0.6f)
-                        )
+                        // Download button — only shown while video mode is active
+                        if (videoModeEnabled) {
+                            when (val dlState = videoDownloadState) {
+                                is VideoDownloadState.Downloading -> {
+                                    Box(
+                                        modifier = Modifier.size(48.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        CircularProgressIndicator(
+                                            progress = { dlState.progress },
+                                            modifier = Modifier.size(24.dp),
+                                            color = textBackgroundColor.copy(alpha = 0.6f),
+                                            strokeWidth = 2.dp
+                                        )
+                                    }
+                                }
+                                is VideoDownloadState.Downloaded -> {
+                                    IconButton(
+                                        onClick = { showDeleteConfirmDialog = true }
+                                    ) {
+                                        Icon(
+                                            painter = painterResource(R.drawable.check),
+                                            contentDescription = stringResource(R.string.video_downloaded),
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                }
+                                else -> {
+                                    IconButton(
+                                        onClick = { playerConnection.downloadCurrentVideo() }
+                                    ) {
+                                        Icon(
+                                            painter = painterResource(R.drawable.download),
+                                            contentDescription = stringResource(R.string.video_download),
+                                            tint = textBackgroundColor.copy(alpha = 0.6f),
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        // Video mode toggle button
+                        IconButton(
+                            onClick = { playerConnection.toggleVideoMode() }
+                        ) {
+                            Icon(
+                                painter = painterResource(R.drawable.slow_motion_video),
+                                contentDescription = stringResource(R.string.music_video),
+                                tint = if (videoModeEnabled) MaterialTheme.colorScheme.primary
+                                       else textBackgroundColor.copy(alpha = 0.6f)
+                            )
+                        }
                     }
 
                     // MV/OP search type toggle + try-next button — only visible when video mode is active
@@ -531,6 +597,22 @@ fun Thumbnail(
                                     modifier = Modifier.size(20.dp)
                                 )
                             }
+                            // Original audio toggle — lets the video play with its own audio track
+                            // (useful for anime openings whose audio differs from the full song)
+                            IconButton(
+                                onClick = { playerConnection.toggleVideoOriginalAudio() }
+                            ) {
+                                Icon(
+                                    painter = painterResource(
+                                        if (videoOriginalAudioMode) R.drawable.volume_up
+                                        else R.drawable.volume_off
+                                    ),
+                                    contentDescription = stringResource(R.string.video_original_audio),
+                                    tint = if (videoOriginalAudioMode) MaterialTheme.colorScheme.primary
+                                           else textBackgroundColor.copy(alpha = 0.6f),
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
                         }
                     }
                 }
@@ -552,6 +634,33 @@ fun Thumbnail(
             modifier = Modifier.align(Alignment.Center)
         ) {
             SeekEffectOverlay(seekDirection = seekDirection)
+        }
+
+        // Delete confirmation dialog
+        if (showDeleteConfirmDialog) {
+            val songId = mediaMetadata?.id
+            AlertDialog(
+                onDismissRequest = { showDeleteConfirmDialog = false },
+                title = { Text(stringResource(R.string.video_download_delete)) },
+                text = { Text(stringResource(R.string.video_download_delete_confirm)) },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            showDeleteConfirmDialog = false
+                            if (songId != null) {
+                                playerConnection.deleteVideoDownload(songId)
+                            }
+                        }
+                    ) {
+                        Text(stringResource(R.string.video_download_delete_action))
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showDeleteConfirmDialog = false }) {
+                        Text(stringResource(R.string.cancel))
+                    }
+                }
+            )
         }
     }
 }

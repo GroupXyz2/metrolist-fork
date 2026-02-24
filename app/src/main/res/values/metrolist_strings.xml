@@ -19,6 +19,13 @@
     <string name="video_mode_op">OP</string>
     <string name="video_mode_switch_to_op">Switch to Anime Opening</string>
     <string name="video_mode_switch_to_mv">Switch to Music Video</string>
+    <string name="video_download">Download video</string>
+    <string name="video_downloaded">Video downloaded</string>
+    <string name="video_download_delete">Delete video download</string>
+    <string name="video_download_delete_confirm">Remove the downloaded video for this song?</string>
+    <string name="video_downloading">Downloading video…</string>
+    <string name="video_download_delete_action">Delete</string>
+    <string name="video_original_audio">Video audio</string>
     <string name="trending">Trending</string>
     <string name="top_result">Top result</string>
     <string name="other_results">Other</string>

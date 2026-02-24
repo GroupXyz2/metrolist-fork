@@ -505,6 +505,16 @@ class PlayerConnection(
 
     fun tryNextVideoResult() = service.tryNextVideoResult()
 
+    // Video download controls
+    val videoDownloadState get() = service.videoDownloadState
+    fun downloadCurrentVideo() = service.downloadCurrentVideo()
+    fun deleteVideoDownload(songId: String) = service.deleteVideoDownload(songId)
+    fun isVideoDownloaded(songId: String) = service.isVideoDownloaded(songId)
+
+    // Video original audio mode
+    val videoOriginalAudioMode get() = service.videoOriginalAudioMode
+    fun toggleVideoOriginalAudio() = service.toggleVideoOriginalAudio()
+
     // ---- End Video Player Controls ------------------------------------------
 
     fun dispose() {

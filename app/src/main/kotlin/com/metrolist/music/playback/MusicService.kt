@@ -201,6 +201,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import timber.log.Timber
+import java.io.File
 import java.io.ObjectInputStream
 import java.io.ObjectOutputStream
 import java.time.LocalDateTime
@@ -380,13 +381,26 @@ class MusicService :
     // Native video dimensions reported by the video player (used for aspect ratio correction)
     val videoSize = MutableStateFlow(VideoSize.UNKNOWN)
 
+    // Whether the video player plays with its own audio (original audio mode)
+    // In this mode the audio ExoPlayer is silenced and position sync is suspended.
+    val videoOriginalAudioMode = MutableStateFlow(false)
+
+    // Tracks the YouTube video ID currently shown in video mode (may differ from song ID)
+    private var currentVideoId: String? = null
+
     // Coroutine job that keeps video player in sync with audio
     private var videoSyncJob: Job? = null
+    // Listener for immediate play/pause mirroring (avoids up-to-500ms polling lag on resume)
+    private var videoSyncListener: Player.Listener? = null
 
     // Search results cache: songId -> ordered list of video IDs from last YouTube search
     private val videoSearchResultsCache = HashMap<String, List<String>>()
     // Which result index is currently displayed per song (0 = top result; increments on "try next")
     private val videoSearchResultIndex = HashMap<String, Int>()
+
+    // Download state and job for the currently displayed video
+    val videoDownloadState = MutableStateFlow<VideoDownloadState>(VideoDownloadState.Idle)
+    private var videoDownloadJob: Job? = null
 
     // Flag to bypass cache when quality changes - forces fresh stream fetch
     private val bypassCacheForQualityChange = mutableSetOf<String>()
@@ -1834,11 +1848,22 @@ class MusicService :
     ) {
         // Track whether video mode was active before the transition
         val wasVideoModeActive = videoModeEnabled.value
-        if (wasVideoModeActive) disableVideoMode()
+        if (wasVideoModeActive) disableVideoMode(restoreStream = false)
+
+        // Cancel any in-progress video download for the previous song
+        videoDownloadJob?.cancel()
+        videoDownloadJob = null
+        // Reflect download state for the incoming song
+        val newSongId = mediaItem?.mediaId
+        videoDownloadState.value = if (newSongId != null && getVideoDownloadFile(newSongId).exists()) {
+            VideoDownloadState.Downloaded
+        } else {
+            VideoDownloadState.Idle
+        }
 
         // Reset search result index for the new song so it starts at the top result
-        mediaItem?.mediaId?.let { newSongId ->
-            videoSearchResultIndex.remove(newSongId)
+        mediaItem?.mediaId?.let { newSongId2 ->
+            videoSearchResultIndex.remove(newSongId2)
         }
 
         // Force Repeat One if the player ignored it and auto-advanced
@@ -2855,18 +2880,36 @@ class MusicService :
         val songId = currentMediaMetadata.value?.id ?: return
         val metadata = currentMediaMetadata.value
         scope.launch(Dispatchers.Main) {
-            val expires = videoUrlCache[songId]?.second ?: 0L
-            var videoUrl = if (!forceRefresh && expires > System.currentTimeMillis()) videoUrlCache[songId]?.first else null
+            // Resolve video URL and track which YouTube video ID is displayed.
+            // resolvedVideoId may differ from songId when an anime opening / MV is found.
+            var resolvedVideoId: String = songId
+
+            val localFile = getVideoDownloadFile(songId)
+            var videoUrl: String? = if (!forceRefresh && localFile.exists()) {
+                // Priority 1: local downloaded file — video ID is always the song's own ID
+                resolvedVideoId = songId
+                localFile.toURI().toString()
+            } else {
+                // Priority 2: in-memory URL cache
+                val expires = videoUrlCache[songId]?.second ?: 0L
+                if (!forceRefresh && expires > System.currentTimeMillis()) {
+                    // Restore the video ID that produced this cached URL
+                    val cachedResults = videoSearchResultsCache[songId]
+                    val idx = videoSearchResultIndex[songId] ?: 0
+                    resolvedVideoId = cachedResults?.getOrNull(idx) ?: songId
+                    videoUrlCache[songId]?.first
+                } else null
+            }
 
             if (videoUrl == null) {
-                videoUrl = withContext(Dispatchers.IO) {
-                    // Search YouTube for the actual music video first
+                // Priority 3: fresh YouTube search + stream fetch
+                data class FetchResult(val videoId: String, val url: String?)
+                val result = withContext(Dispatchers.IO) {
                     val title = metadata?.title
                     val artist = metadata?.artists?.firstOrNull()?.name
                     val isOpeningMode = dataStore.get(VideoOpeningModeKey, false)
                     val currentResultIndex = videoSearchResultIndex[songId] ?: 0
 
-                    // Use cached search results if available at the requested index
                     val cachedResults = videoSearchResultsCache[songId]
                     var musicVideoId: String? = if (cachedResults != null && currentResultIndex < cachedResults.size) {
                         val id = cachedResults[currentResultIndex]
@@ -2888,7 +2931,6 @@ class MusicService :
                                     ?.items
                                     ?.filterIsInstance<SongItem>()
                                 if (!results.isNullOrEmpty()) {
-                                    // Cache all result IDs so "try next" can skip without re-searching
                                     videoSearchResultsCache[songId] = results.map { it.id }
                                     val targetIndex = videoSearchResultIndex[songId] ?: 0
                                     musicVideoId = results.getOrNull(targetIndex)?.id ?: results.first().id
@@ -2900,11 +2942,12 @@ class MusicService :
                         }
                     }
 
-                    // Use found video ID or fall back to song's own ID
-                    YTPlayerUtils.videoStreamUrlForPlayback(musicVideoId ?: songId)
+                    val finalVideoId = musicVideoId ?: songId
+                    FetchResult(finalVideoId, YTPlayerUtils.videoStreamUrlForPlayback(finalVideoId))
                 }
+                resolvedVideoId = result.videoId
+                videoUrl = result.url
                 if (videoUrl != null) {
-                    // Cache for 6 hours (YouTube video URLs typically last ~6 hours)
                     videoUrlCache[songId] = videoUrl to System.currentTimeMillis() + (6 * 3600 * 1000L)
                 }
             }
@@ -2913,6 +2956,9 @@ class MusicService :
                 Timber.tag(TAG).w("enableVideoMode: no video URL available for $songId")
                 return@launch
             }
+
+            // Store the resolved video ID so toggleVideoOriginalAudio() can use it
+            currentVideoId = resolvedVideoId
 
             val vp = createVideoExoPlayer()
             vp.addListener(object : Player.Listener {
@@ -2933,33 +2979,72 @@ class MusicService :
             vp.playWhenReady = player.isPlaying
             videoModeEnabled.value = true
 
-            // Drift-correction coroutine
+            // Immediately mirror play/pause state changes rather than waiting for the 500ms poll.
+            // On resume: seek the video to the current audio position first so both players
+            // start from the exact same point and no compensatory drift-seek is needed.
+            videoSyncListener?.let { player.removeListener(it) }
+            videoSyncListener = object : Player.Listener {
+                override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                    if (playWhenReady) {
+                        // Sync position before unpausing so video and audio resume in lockstep
+                        vp.seekTo(player.currentPosition)
+                    }
+                    vp.playWhenReady = playWhenReady
+                }
+            }
+            player.addListener(videoSyncListener!!)
+
+            // Drift-correction polling coroutine — only corrects position while actively playing
             videoSyncJob?.cancel()
             videoSyncJob = scope.launch(Dispatchers.Main) {
                 while (isActive) {
                     delay(500)
-                    val audioPosMs = player.currentPosition
-                    val videoPosMs = vp.currentPosition
-                    if (kotlin.math.abs(audioPosMs - videoPosMs) > 1000) {
-                        vp.seekTo(audioPosMs)
-                    }
-                    // Mirror play/pause
-                    if (vp.playWhenReady != player.isPlaying) {
-                        vp.playWhenReady = player.isPlaying
+                    val vp2 = videoPlayer ?: break
+                    if (vp2.playWhenReady) {
+                        val audioPosMs = player.currentPosition
+                        val videoPosMs = vp2.currentPosition
+                        if (kotlin.math.abs(audioPosMs - videoPosMs) > 500) {
+                            vp2.seekTo(audioPosMs)
+                        }
                     }
                 }
             }
+
         }
     }
 
-    fun disableVideoMode() {
+    fun disableVideoMode(restoreStream: Boolean = true) {
         videoSyncJob?.cancel()
         videoSyncJob = null
+        videoSyncListener?.let { player.removeListener(it) }
+        videoSyncListener = null
         videoPlayer?.stop()
         videoPlayer?.release()
         videoPlayer = null
         videoModeEnabled.value = false
         videoSize.value = VideoSize.UNKNOWN
+
+        val hadOriginalAudio = videoOriginalAudioMode.value
+        videoOriginalAudioMode.value = false
+        currentVideoId = null
+
+        // Restore main player volume if it was muted by original audio mode
+        if (hadOriginalAudio) {
+            player.volume = if (isMuted.value) 0f else playerVolume.value
+        }
+
+        // Re-prepare the main player so it returns to the normal song stream.
+        // Skip during song transitions (restoreStream = false) since the player
+        // already handles the new song naturally.
+        if (hadOriginalAudio && restoreStream) {
+            val wasPlaying = player.isPlaying
+            val currentIndex = player.currentMediaItemIndex
+            val currentPosition = player.currentPosition
+            player.stop()
+            player.seekTo(currentIndex, currentPosition)
+            player.prepare()
+            if (wasPlaying) player.play()
+        }
     }
 
     fun switchVideoSearchType() {
@@ -3003,6 +3088,228 @@ class MusicService :
         }
     }
 
+    /**
+     * Toggles "original audio" mode for the video player.
+     *
+     * **ON** → Mutes the main audio player and replaces the video-only player with a new
+     *         ExoPlayer that plays a muxed YouTube stream (contains both audio and video).
+     *         This player provides the audio output directly, bypassing the song URL cache entirely.
+     *
+     * **OFF** → Restores the main player volume and reloads the standard video-only player.
+     */
+    fun toggleVideoOriginalAudio() {
+        val songId = currentMediaMetadata.value?.id ?: return
+
+        if (videoOriginalAudioMode.value) {
+            // ── Turning OFF: restore normal muted video mode ─────────────────
+            videoOriginalAudioMode.value = false
+
+            // Restore main player volume
+            player.volume = if (isMuted.value) 0f else playerVolume.value
+
+            // Cancel sync jobs and remove listener before releasing the player
+            videoSyncJob?.cancel()
+            videoSyncJob = null
+            videoSyncListener?.let { player.removeListener(it) }
+            videoSyncListener = null
+
+            // Stop and release the muxed audio+video player
+            videoPlayer?.stop()
+            videoPlayer?.release()
+            videoPlayer = null
+
+            // Reload standard video-only player from URL cache
+            enableVideoMode()
+        } else {
+            // ── Turning ON: mute main player, use muxed stream with audio ─────
+            val vp = videoPlayer ?: return
+            val videoId = currentVideoId ?: songId
+            val wasPlaying = player.isPlaying
+            val currentPosition = player.currentPosition
+
+            scope.launch(Dispatchers.Main) {
+                val muxedUrl = withContext(Dispatchers.IO) {
+                    // Local mp4 files already contain audio — use them directly
+                    val cachedVideoUrl = videoUrlCache[songId]?.first
+                    if (cachedVideoUrl != null && cachedVideoUrl.startsWith("file:")) {
+                        cachedVideoUrl
+                    } else {
+                        YTPlayerUtils.muxedVideoUrlForPlayback(videoId)
+                    }
+                }
+
+                if (muxedUrl == null) {
+                    Timber.tag(TAG).w("toggleVideoOriginalAudio: could not fetch muxed URL for $videoId")
+                    return@launch
+                }
+
+                // Mute the main audio player — the new video player will handle audio output
+                player.volume = 0f
+
+                // Cancel existing sync and release the video-only player
+                videoSyncJob?.cancel()
+                videoSyncJob = null
+                videoSyncListener?.let { player.removeListener(it) }
+                videoSyncListener = null
+                vp.stop()
+                vp.release()
+                videoPlayer = null
+
+                // Create a new video player with audio ENABLED (muxed stream has audio track)
+                val avp = createAudioVideoExoPlayer()
+                avp.addListener(object : Player.Listener {
+                    override fun onVideoSizeChanged(size: VideoSize) {
+                        videoSize.value = size
+                    }
+                    override fun onPlayerError(error: PlaybackException) {
+                        Timber.tag(TAG).e("Audio+video player error: ${error.message}")
+                    }
+                })
+                videoPlayer = avp
+                currentVideoSurface?.let { avp.setVideoSurface(it) }
+                avp.setMediaItem(MediaItem.fromUri(muxedUrl.toUri()))
+                avp.prepare()
+                avp.seekTo(currentPosition)
+                avp.playWhenReady = wasPlaying
+
+                videoOriginalAudioMode.value = true
+
+                // Mirror play/pause state from main player to the muxed player
+                videoSyncListener = object : Player.Listener {
+                    override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                        if (playWhenReady) {
+                            avp.seekTo(player.currentPosition)
+                        }
+                        avp.playWhenReady = playWhenReady
+                    }
+                }
+                player.addListener(videoSyncListener!!)
+
+                // Drift-correction polling
+                videoSyncJob = scope.launch(Dispatchers.Main) {
+                    while (isActive) {
+                        delay(500)
+                        val vp2 = videoPlayer ?: break
+                        if (vp2.playWhenReady) {
+                            val audioPosMs = player.currentPosition
+                            val videoPosMs = vp2.currentPosition
+                            if (kotlin.math.abs(audioPosMs - videoPosMs) > 500) {
+                                vp2.seekTo(audioPosMs)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+    // ---- Video Download Helpers ---------------------------------------------
+
+    /** Returns the file path where a downloaded video for [songId] is stored. */
+    private fun getVideoDownloadFile(songId: String): File =
+        filesDir.resolve("video_downloads").resolve("$songId.mp4")
+
+    /** Returns true if a downloaded video file exists for [songId]. */
+    fun isVideoDownloaded(songId: String): Boolean = getVideoDownloadFile(songId).exists()
+
+    /**
+     * Downloads the currently displayed video for offline playback.
+     * Reads the active video URL (from the URL cache or by running a fresh YouTube search)
+     * and streams it to private app storage. Progress is exposed via [videoDownloadState].
+     */
+    fun downloadCurrentVideo() {
+        val songId = currentMediaMetadata.value?.id ?: return
+
+        // Already downloaded or download already running
+        if (videoDownloadState.value is VideoDownloadState.Downloaded) return
+        if (videoDownloadState.value is VideoDownloadState.Downloading) return
+
+        videoDownloadJob?.cancel()
+        videoDownloadJob = scope.launch(Dispatchers.IO) {
+            try {
+                videoDownloadState.value = VideoDownloadState.Downloading(0f)
+
+                // Resolve a playable video URL (re-use cache when fresh enough)
+                val expires = videoUrlCache[songId]?.second ?: 0L
+                val cachedUrl = if (expires > System.currentTimeMillis()) videoUrlCache[songId]?.first else null
+                val videoUrl = cachedUrl ?: YTPlayerUtils.videoStreamUrlForPlayback(songId)
+                if (videoUrl == null) {
+                    videoDownloadState.value = VideoDownloadState.Error
+                    return@launch
+                }
+
+                val destDir = filesDir.resolve("video_downloads")
+                destDir.mkdirs()
+                val tmpFile = destDir.resolve("$songId.mp4.tmp")
+                val destFile = getVideoDownloadFile(songId)
+
+                val client = OkHttpClient.Builder()
+                    .proxy(com.metrolist.innertube.YouTube.proxy)
+                    .build()
+                val request = okhttp3.Request.Builder().url(videoUrl).build()
+                val response = client.newCall(request).execute()
+
+                if (!response.isSuccessful) {
+                    videoDownloadState.value = VideoDownloadState.Error
+                    return@launch
+                }
+
+                val body = response.body
+                if (body == null) {
+                    videoDownloadState.value = VideoDownloadState.Error
+                    return@launch
+                }
+
+                val contentLength = body.contentLength()
+                var bytesRead = 0L
+
+                tmpFile.outputStream().use { out ->
+                    body.byteStream().use { input ->
+                        val buf = ByteArray(8 * 1024)
+                        var n: Int
+                        while (input.read(buf).also { n = it } != -1) {
+                            if (!isActive) {
+                                tmpFile.delete()
+                                return@launch
+                            }
+                            out.write(buf, 0, n)
+                            bytesRead += n
+                            if (contentLength > 0) {
+                                videoDownloadState.value =
+                                    VideoDownloadState.Downloading(bytesRead.toFloat() / contentLength)
+                            }
+                        }
+                    }
+                }
+
+                // Atomically move tmp → final
+                tmpFile.renameTo(destFile)
+                videoDownloadState.value = VideoDownloadState.Downloaded
+                Timber.tag(TAG).d("Video downloaded for $songId")
+            } catch (e: Exception) {
+                if (isActive) {
+                    Timber.tag(TAG).e(e, "Video download failed for $songId")
+                    videoDownloadState.value = VideoDownloadState.Error
+                }
+            }
+        }
+    }
+
+    /** Deletes the locally stored video for [songId] and resets download state. */
+    fun deleteVideoDownload(songId: String) {
+        videoDownloadJob?.cancel()
+        videoDownloadJob = null
+        val file = getVideoDownloadFile(songId)
+        if (file.exists()) file.delete()
+        // Only reset if the state belongs to the current song
+        if (currentMediaMetadata.value?.id == songId) {
+            videoDownloadState.value = VideoDownloadState.Idle
+        }
+    }
+
+    // ---- End Video Download Helpers -----------------------------------------
+
     private fun createVideoExoPlayer(): ExoPlayer =
         ExoPlayer.Builder(this, DefaultRenderersFactory(this).setEnableDecoderFallback(true))
             .setMediaSourceFactory(DefaultMediaSourceFactory(createVideoDataSourceFactory()))
@@ -3016,6 +3323,23 @@ class MusicService :
                 trackSelectionParameters = trackSelectionParameters.buildUpon()
                     .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
                     .build()
+            }
+
+    /** Creates an ExoPlayer for muxed streams where BOTH video and audio tracks are played. */
+    private fun createAudioVideoExoPlayer(): ExoPlayer =
+        ExoPlayer.Builder(this, DefaultRenderersFactory(this).setEnableDecoderFallback(true))
+            .setMediaSourceFactory(DefaultMediaSourceFactory(createVideoDataSourceFactory()))
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                    .build(),
+                /* handleAudioFocus= */ false
+            )
+            .build()
+            .apply {
+                volume = 1f
+                // Audio track is intentionally NOT disabled here
             }
 
     private fun createVideoDataSourceFactory(): DataSource.Factory =

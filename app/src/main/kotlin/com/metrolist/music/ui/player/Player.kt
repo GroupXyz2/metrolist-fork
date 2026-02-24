@@ -10,6 +10,8 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.app.Activity
+import android.content.pm.ActivityInfo
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.compose.animation.AnimatedContent
@@ -566,6 +568,24 @@ fun BottomSheetPlayer(
 
     var isFullScreen by rememberSaveable {
         mutableStateOf(false)
+    }
+
+    // Tracks whether we've programmatically locked the orientation to landscape for video fullscreen
+    var videoLandscapeLocked by rememberSaveable { mutableStateOf(false) }
+    val activity = LocalContext.current as? Activity
+
+    // Apply/remove orientation lock when user taps the video
+    LaunchedEffect(videoLandscapeLocked) {
+        activity?.requestedOrientation = if (videoLandscapeLocked)
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        else
+            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    }
+    // Release lock automatically when video mode is turned off
+    LaunchedEffect(videoModeEnabled) {
+        if (!videoModeEnabled && videoLandscapeLocked) {
+            videoLandscapeLocked = false
+        }
     }
 
     // Position update - only for local playback
@@ -1564,7 +1584,8 @@ fun BottomSheetPlayer(
                             modifier = Modifier.fillMaxSize(),
                             isPlayerExpanded = isExpandedProvider,
                             isLandscape = true,
-                            isListenTogetherGuest = isListenTogetherGuest
+                            isListenTogetherGuest = isListenTogetherGuest,
+                            onVideoTap = { videoLandscapeLocked = !videoLandscapeLocked }
                         )
                     }
                 } else {
@@ -1608,7 +1629,8 @@ fun BottomSheetPlayer(
                                         modifier = Modifier.animateContentSize(),
                                         isPlayerExpanded = isExpandedProvider,
                                         isLandscape = true,
-                                        isListenTogetherGuest = isListenTogetherGuest
+                                        isListenTogetherGuest = isListenTogetherGuest,
+                                        onVideoTap = { videoLandscapeLocked = !videoLandscapeLocked }
                                     )
                                 }
                             }
@@ -1670,7 +1692,8 @@ fun BottomSheetPlayer(
                                     sliderPositionProvider = sliderPositionProvider,
                                     modifier = Modifier.nestedScroll(state.preUpPostDownNestedScrollConnection),
                                     isPlayerExpanded = isExpandedProvider,
-                                    isListenTogetherGuest = isListenTogetherGuest
+                                    isListenTogetherGuest = isListenTogetherGuest,
+                                    onVideoTap = { videoLandscapeLocked = !videoLandscapeLocked }
                                 )
                             }
                         }
