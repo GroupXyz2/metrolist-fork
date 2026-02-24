@@ -15,6 +15,10 @@
     <string name="album_cover_desc">Album cover</string>
     <string name="top_music_videos">Top music videos</string>
     <string name="music_video">Music Video</string>
+    <string name="video_mode_mv">MV</string>
+    <string name="video_mode_op">OP</string>
+    <string name="video_mode_switch_to_op">Switch to Anime Opening</string>
+    <string name="video_mode_switch_to_mv">Switch to Music Video</string>
     <string name="trending">Trending</string>
     <string name="top_result">Top result</string>
     <string name="other_results">Other</string>

@@ -501,6 +501,10 @@ class PlayerConnection(
 
     fun setVideoSurface(surface: android.view.Surface?) = service.setVideoSurface(surface)
 
+    fun switchVideoSearchType() = service.switchVideoSearchType()
+
+    fun tryNextVideoResult() = service.tryNextVideoResult()
+
     // ---- End Video Player Controls ------------------------------------------
 
     fun dispose() {

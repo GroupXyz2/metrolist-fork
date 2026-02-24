@@ -106,6 +106,7 @@ import com.metrolist.music.constants.EnableDiscordRPCKey
 import com.metrolist.music.constants.EnableLastFMScrobblingKey
 import com.metrolist.music.constants.HideExplicitKey
 import com.metrolist.music.constants.HideVideoSongsKey
+import com.metrolist.music.constants.VideoOpeningModeKey
 import com.metrolist.music.constants.HistoryDuration
 import com.metrolist.music.constants.LastFMUseNowPlaying
 import com.metrolist.music.constants.MediaSessionConstants.CommandToggleLike
@@ -381,6 +382,11 @@ class MusicService :
 
     // Coroutine job that keeps video player in sync with audio
     private var videoSyncJob: Job? = null
+
+    // Search results cache: songId -> ordered list of video IDs from last YouTube search
+    private val videoSearchResultsCache = HashMap<String, List<String>>()
+    // Which result index is currently displayed per song (0 = top result; increments on "try next")
+    private val videoSearchResultIndex = HashMap<String, Int>()
 
     // Flag to bypass cache when quality changes - forces fresh stream fetch
     private val bypassCacheForQualityChange = mutableSetOf<String>()
@@ -1826,8 +1832,14 @@ class MusicService :
         mediaItem: MediaItem?,
         reason: Int,
     ) {
-        // Disable video mode when the song changes - user must re-enable for new song
-        if (videoModeEnabled.value) disableVideoMode()
+        // Track whether video mode was active before the transition
+        val wasVideoModeActive = videoModeEnabled.value
+        if (wasVideoModeActive) disableVideoMode()
+
+        // Reset search result index for the new song so it starts at the top result
+        mediaItem?.mediaId?.let { newSongId ->
+            videoSearchResultIndex.remove(newSongId)
+        }
 
         // Force Repeat One if the player ignored it and auto-advanced
         if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
@@ -1895,6 +1907,16 @@ class MusicService :
         // Save state when media item changes
         if (dataStore.get(PersistentQueueKey, true)) {
             saveQueueToDisk()
+        }
+
+        // Persist video mode: auto-enable for the new song if it was active before transition
+        if (wasVideoModeActive && mediaItem != null) {
+            val newSongId = mediaItem.mediaId
+            scope.launch {
+                // Wait until currentMediaMetadata reflects the new song before enabling
+                currentMediaMetadata.first { it?.id == newSongId }
+                enableVideoMode()
+            }
         }
     }
 
@@ -2818,39 +2840,63 @@ class MusicService :
 
     // ---- Video Player -------------------------------------------------------
 
+    // Tracks the surface currently bound to the TextureView in Thumbnail.kt.
+    // Used to re-attach the surface to a newly created videoPlayer when Compose
+    // skips the TextureView teardown/setup cycle (e.g. fast off→on toggle where
+    // the snapshot system collapses false→true into a single true observation).
+    private var currentVideoSurface: android.view.Surface? = null
+
     fun setVideoSurface(surface: android.view.Surface?) {
+        currentVideoSurface = surface
         videoPlayer?.setVideoSurface(surface)
     }
 
-    fun enableVideoMode() {
+    fun enableVideoMode(forceRefresh: Boolean = false) {
         val songId = currentMediaMetadata.value?.id ?: return
         val metadata = currentMediaMetadata.value
         scope.launch(Dispatchers.Main) {
             val expires = videoUrlCache[songId]?.second ?: 0L
-            var videoUrl = if (expires > System.currentTimeMillis()) videoUrlCache[songId]?.first else null
+            var videoUrl = if (!forceRefresh && expires > System.currentTimeMillis()) videoUrlCache[songId]?.first else null
 
             if (videoUrl == null) {
                 videoUrl = withContext(Dispatchers.IO) {
                     // Search YouTube for the actual music video first
                     val title = metadata?.title
                     val artist = metadata?.artists?.firstOrNull()?.name
-                    var musicVideoId: String? = null
+                    val isOpeningMode = dataStore.get(VideoOpeningModeKey, false)
+                    val currentResultIndex = videoSearchResultIndex[songId] ?: 0
 
-                    if (title != null) {
-                        val query = if (artist != null) "$title $artist" else title
-                        try {
-                            val results = YouTube.search(query, YouTube.SearchFilter.FILTER_VIDEO)
-                                .getOrNull()
-                                ?.items
-                                ?.filterIsInstance<SongItem>()
-                            // Prefer results that are actual music videos (not static cover art)
-                            musicVideoId = results?.firstOrNull { it.isVideoSong }?.id
-                                ?: results?.firstOrNull()?.id
-                            if (musicVideoId != null) {
-                                Timber.tag(TAG).d("Found music video $musicVideoId for: $query")
+                    // Use cached search results if available at the requested index
+                    val cachedResults = videoSearchResultsCache[songId]
+                    var musicVideoId: String? = if (cachedResults != null && currentResultIndex < cachedResults.size) {
+                        val id = cachedResults[currentResultIndex]
+                        Timber.tag(TAG).d("Using cached search result index $currentResultIndex/${cachedResults.size} ($id) for $songId")
+                        id
+                    } else null
+
+                    if (musicVideoId == null) {
+                        if (title != null) {
+                            val query = when {
+                                isOpeningMode && artist != null -> "$title $artist anime opening"
+                                isOpeningMode -> "$title anime opening"
+                                artist != null -> "$title $artist"
+                                else -> title
                             }
-                        } catch (e: Exception) {
-                            Timber.tag(TAG).w(e, "Music video search failed, using song ID")
+                            try {
+                                val results = YouTube.search(query, YouTube.SearchFilter.FILTER_VIDEO)
+                                    .getOrNull()
+                                    ?.items
+                                    ?.filterIsInstance<SongItem>()
+                                if (!results.isNullOrEmpty()) {
+                                    // Cache all result IDs so "try next" can skip without re-searching
+                                    videoSearchResultsCache[songId] = results.map { it.id }
+                                    val targetIndex = videoSearchResultIndex[songId] ?: 0
+                                    musicVideoId = results.getOrNull(targetIndex)?.id ?: results.first().id
+                                    Timber.tag(TAG).d("Found ${if (isOpeningMode) "anime opening" else "music video"} $musicVideoId (index $targetIndex/${results.size}) for: $query")
+                                }
+                            } catch (e: Exception) {
+                                Timber.tag(TAG).w(e, "Music video search failed, using song ID")
+                            }
                         }
                     }
 
@@ -2878,6 +2924,9 @@ class MusicService :
                 }
             })
             videoPlayer = vp
+            // Re-attach the existing surface immediately if Compose skipped the
+            // TextureView teardown/setup cycle (fast toggle: off → on).
+            currentVideoSurface?.let { vp.setVideoSurface(it) }
             vp.setMediaItem(MediaItem.fromUri(videoUrl.toUri()))
             vp.prepare()
             vp.seekTo(player.currentPosition)
@@ -2911,6 +2960,47 @@ class MusicService :
         videoPlayer = null
         videoModeEnabled.value = false
         videoSize.value = VideoSize.UNKNOWN
+    }
+
+    fun switchVideoSearchType() {
+        val songId = currentMediaMetadata.value?.id ?: return
+        val newMode = !dataStore.get(VideoOpeningModeKey, false)
+        scope.launch {
+            dataStore.edit { it[VideoOpeningModeKey] = newMode }
+        }
+        // Clear all caches — different mode means different search results
+        videoUrlCache.remove(songId)
+        videoSearchResultsCache.remove(songId)
+        videoSearchResultIndex.remove(songId)
+        // Reload video if currently active
+        if (videoModeEnabled.value) {
+            disableVideoMode()
+            enableVideoMode(forceRefresh = true)
+        }
+    }
+
+    fun tryNextVideoResult() {
+        val songId = currentMediaMetadata.value?.id ?: return
+        val cachedResults = videoSearchResultsCache[songId]
+        val currentIndex = videoSearchResultIndex[songId] ?: 0
+
+        if (!cachedResults.isNullOrEmpty() && cachedResults.size > 1) {
+            val nextIndex = (currentIndex + 1) % cachedResults.size
+            videoSearchResultIndex[songId] = nextIndex
+            Timber.tag(TAG).d("Trying next video result: index $nextIndex/${cachedResults.size} for $songId")
+        } else {
+            // No cached results yet — force a fresh search (will populate the cache)
+            Timber.tag(TAG).d("No cached results for $songId, forcing fresh search")
+            videoSearchResultsCache.remove(songId)
+        }
+
+        // Clear the cached stream URL so we fetch a fresh one for the new video ID
+        videoUrlCache.remove(songId)
+
+        if (videoModeEnabled.value) {
+            disableVideoMode()
+            enableVideoMode(forceRefresh = true)
+        }
     }
 
     private fun createVideoExoPlayer(): ExoPlayer =

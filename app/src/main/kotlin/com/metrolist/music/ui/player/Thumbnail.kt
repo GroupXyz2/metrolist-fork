@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -81,6 +82,7 @@ import com.metrolist.music.LocalPlayerConnection
 import com.metrolist.music.R
 import com.metrolist.music.constants.CropAlbumArtKey
 import com.metrolist.music.constants.HidePlayerThumbnailKey
+import com.metrolist.music.constants.VideoOpeningModeKey
 import com.metrolist.music.constants.PlayerBackgroundStyle
 import com.metrolist.music.constants.PlayerBackgroundStyleKey
 import com.metrolist.music.constants.PlayerHorizontalPadding
@@ -227,6 +229,7 @@ fun Thumbnail(
     val swipeThumbnail = swipeThumbnailPref && !isListenTogetherGuest
     val hidePlayerThumbnail by rememberPreference(HidePlayerThumbnailKey, false)
     val cropAlbumArt by rememberPreference(CropAlbumArtKey, false)
+    val videoOpeningMode by rememberPreference(VideoOpeningModeKey, false)
     val playerBackground by rememberEnumPreference(
         key = PlayerBackgroundStyleKey,
         defaultValue = PlayerBackgroundStyle.DEFAULT
@@ -494,6 +497,41 @@ fun Thumbnail(
                             tint = if (videoModeEnabled) MaterialTheme.colorScheme.primary
                                    else textBackgroundColor.copy(alpha = 0.6f)
                         )
+                    }
+
+                    // MV/OP search type toggle + try-next button — only visible when video mode is active
+                    if (videoModeEnabled) {
+                        Row(
+                            modifier = Modifier
+                                .align(Alignment.BottomStart)
+                                .padding(start = PlayerHorizontalPadding, bottom = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            // MV / OP mode toggle
+                            IconButton(
+                                onClick = { playerConnection.switchVideoSearchType() }
+                            ) {
+                                Text(
+                                    text = if (videoOpeningMode) stringResource(R.string.video_mode_op)
+                                           else stringResource(R.string.video_mode_mv),
+                                    color = if (videoOpeningMode) MaterialTheme.colorScheme.primary
+                                            else textBackgroundColor.copy(alpha = 0.6f),
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            // Try next search result
+                            IconButton(
+                                onClick = { playerConnection.tryNextVideoResult() }
+                            ) {
+                                Icon(
+                                    painter = painterResource(R.drawable.skip_next),
+                                    contentDescription = stringResource(R.string.video_mode_switch_to_op),
+                                    tint = textBackgroundColor.copy(alpha = 0.6f),
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
                     }
                 }
             }
