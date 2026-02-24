@@ -35,6 +35,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.common.Player.EVENT_POSITION_DISCONTINUITY
 import androidx.media3.common.Player.EVENT_TIMELINE_CHANGED
 import androidx.media3.common.Player.REPEAT_MODE_ALL
@@ -191,6 +192,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.plus
@@ -363,6 +365,22 @@ class MusicService :
 
     // URL cache for stream URLs - class-level so it can be invalidated on errors
     private val songUrlCache = HashMap<String, Pair<String, Long>>()
+
+    // Video URL cache keyed by media/video id
+    private val videoUrlCache = HashMap<String, Pair<String, Long>>()
+
+    // Video player for music video playback (muted, separate from audio)
+    var videoPlayer: ExoPlayer? = null
+        private set
+
+    // Whether video mode is currently active
+    val videoModeEnabled = MutableStateFlow(false)
+
+    // Native video dimensions reported by the video player (used for aspect ratio correction)
+    val videoSize = MutableStateFlow(VideoSize.UNKNOWN)
+
+    // Coroutine job that keeps video player in sync with audio
+    private var videoSyncJob: Job? = null
 
     // Flag to bypass cache when quality changes - forces fresh stream fetch
     private val bypassCacheForQualityChange = mutableSetOf<String>()
@@ -1808,6 +1826,9 @@ class MusicService :
         mediaItem: MediaItem?,
         reason: Int,
     ) {
+        // Disable video mode when the song changes - user must re-enable for new song
+        if (videoModeEnabled.value) disableVideoMode()
+
         // Force Repeat One if the player ignored it and auto-advanced
         if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
             val repeatMode = runBlocking { dataStore.get(RepeatModeKey, REPEAT_MODE_OFF) }
@@ -2750,6 +2771,12 @@ class MusicService :
 
                 songUrlCache[mediaId] =
                     streamUrl to System.currentTimeMillis() + (nonNullPlayback.streamExpiresInSeconds * 1000L)
+
+                // Cache video URL if available
+                nonNullPlayback.videoStreamUrl?.let { videoUrl ->
+                    videoUrlCache[mediaId] = videoUrl to System.currentTimeMillis() + (nonNullPlayback.streamExpiresInSeconds * 1000L)
+                }
+
                 return@Factory dataSpec.withUri(streamUrl.toUri()).subrange(dataSpec.uriPositionOffset, CHUNK_LENGTH)
             }
         }
@@ -2788,6 +2815,130 @@ class MusicService :
                     ),
                 ).build()
         }
+
+    // ---- Video Player -------------------------------------------------------
+
+    fun setVideoSurface(surface: android.view.Surface?) {
+        videoPlayer?.setVideoSurface(surface)
+    }
+
+    fun enableVideoMode() {
+        val songId = currentMediaMetadata.value?.id ?: return
+        val metadata = currentMediaMetadata.value
+        scope.launch(Dispatchers.Main) {
+            val expires = videoUrlCache[songId]?.second ?: 0L
+            var videoUrl = if (expires > System.currentTimeMillis()) videoUrlCache[songId]?.first else null
+
+            if (videoUrl == null) {
+                videoUrl = withContext(Dispatchers.IO) {
+                    // Search YouTube for the actual music video first
+                    val title = metadata?.title
+                    val artist = metadata?.artists?.firstOrNull()?.name
+                    var musicVideoId: String? = null
+
+                    if (title != null) {
+                        val query = if (artist != null) "$title $artist" else title
+                        try {
+                            val results = YouTube.search(query, YouTube.SearchFilter.FILTER_VIDEO)
+                                .getOrNull()
+                                ?.items
+                                ?.filterIsInstance<SongItem>()
+                            // Prefer results that are actual music videos (not static cover art)
+                            musicVideoId = results?.firstOrNull { it.isVideoSong }?.id
+                                ?: results?.firstOrNull()?.id
+                            if (musicVideoId != null) {
+                                Timber.tag(TAG).d("Found music video $musicVideoId for: $query")
+                            }
+                        } catch (e: Exception) {
+                            Timber.tag(TAG).w(e, "Music video search failed, using song ID")
+                        }
+                    }
+
+                    // Use found video ID or fall back to song's own ID
+                    YTPlayerUtils.videoStreamUrlForPlayback(musicVideoId ?: songId)
+                }
+                if (videoUrl != null) {
+                    // Cache for 6 hours (YouTube video URLs typically last ~6 hours)
+                    videoUrlCache[songId] = videoUrl to System.currentTimeMillis() + (6 * 3600 * 1000L)
+                }
+            }
+
+            if (videoUrl == null) {
+                Timber.tag(TAG).w("enableVideoMode: no video URL available for $songId")
+                return@launch
+            }
+
+            val vp = createVideoExoPlayer()
+            vp.addListener(object : Player.Listener {
+                override fun onVideoSizeChanged(size: VideoSize) {
+                    videoSize.value = size
+                }
+                override fun onPlayerError(error: PlaybackException) {
+                    Timber.tag(TAG).e("Video player error: ${error.message}")
+                }
+            })
+            videoPlayer = vp
+            vp.setMediaItem(MediaItem.fromUri(videoUrl.toUri()))
+            vp.prepare()
+            vp.seekTo(player.currentPosition)
+            vp.playWhenReady = player.isPlaying
+            videoModeEnabled.value = true
+
+            // Drift-correction coroutine
+            videoSyncJob?.cancel()
+            videoSyncJob = scope.launch(Dispatchers.Main) {
+                while (isActive) {
+                    delay(500)
+                    val audioPosMs = player.currentPosition
+                    val videoPosMs = vp.currentPosition
+                    if (kotlin.math.abs(audioPosMs - videoPosMs) > 1000) {
+                        vp.seekTo(audioPosMs)
+                    }
+                    // Mirror play/pause
+                    if (vp.playWhenReady != player.isPlaying) {
+                        vp.playWhenReady = player.isPlaying
+                    }
+                }
+            }
+        }
+    }
+
+    fun disableVideoMode() {
+        videoSyncJob?.cancel()
+        videoSyncJob = null
+        videoPlayer?.stop()
+        videoPlayer?.release()
+        videoPlayer = null
+        videoModeEnabled.value = false
+        videoSize.value = VideoSize.UNKNOWN
+    }
+
+    private fun createVideoExoPlayer(): ExoPlayer =
+        ExoPlayer.Builder(this, DefaultRenderersFactory(this).setEnableDecoderFallback(true))
+            .setMediaSourceFactory(DefaultMediaSourceFactory(createVideoDataSourceFactory()))
+            .setAudioAttributes(AudioAttributes.DEFAULT, /* handleAudioFocus= */ false)
+            .build()
+            .apply {
+                volume = 0f
+                // Disable audio track decoding entirely — we only need video frames.
+                // Running an audio decoder alongside the main audio player wastes resources
+                // and can cause codec contention on constrained devices/emulators.
+                trackSelectionParameters = trackSelectionParameters.buildUpon()
+                    .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
+                    .build()
+            }
+
+    private fun createVideoDataSourceFactory(): DataSource.Factory =
+        DefaultDataSource.Factory(
+            this,
+            OkHttpDataSource.Factory(
+                okhttp3.OkHttpClient.Builder()
+                    .proxy(com.metrolist.innertube.YouTube.proxy)
+                    .build()
+            )
+        )
+
+    // ---- End Video Player ---------------------------------------------------
 
     override fun onPlaybackStatsReady(
         eventTime: AnalyticsListener.EventTime,
@@ -2928,11 +3079,16 @@ class MusicService :
         player.removeListener(this)
         player.removeListener(sleepTimer)
         playerSilenceProcessors.remove(player)
+        // Cancel the coroutine scope before releasing the player so no pending coroutine
+        // (enableVideoMode, playQueue, etc.) can try to use the player after it's released,
+        // which would throw IllegalStateException on the main thread and crash the process.
+        scope.cancel()
         // Note: equalizerService audio processors are cleared in equalizerService.release() if needed,
         // or we can't easily reference the specific processor created in createExoPlayer here without storing it.
         // But since we are destroying the service, it's fine.
         player.release()
         discordUpdateJob?.cancel()
+        disableVideoMode()
         super.onDestroy()
     }
 

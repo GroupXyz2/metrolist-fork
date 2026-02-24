@@ -490,6 +490,19 @@ class PlayerConnection(
         }
     }
 
+    // ---- Video Player Controls ----------------------------------------------
+
+    val videoModeEnabled get() = service.videoModeEnabled
+    val videoSize get() = service.videoSize
+
+    fun toggleVideoMode() {
+        if (service.videoModeEnabled.value) service.disableVideoMode() else service.enableVideoMode()
+    }
+
+    fun setVideoSurface(surface: android.view.Surface?) = service.setVideoSurface(surface)
+
+    // ---- End Video Player Controls ------------------------------------------
+
     fun dispose() {
         try {
             attachedPlayer?.removeListener(this)

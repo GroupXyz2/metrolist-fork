@@ -67,6 +67,8 @@ object YTPlayerUtils {
         val format: PlayerResponse.StreamingData.Format,
         val streamUrl: String,
         val streamExpiresInSeconds: Int,
+        val videoFormat: PlayerResponse.StreamingData.Format? = null,
+        val videoStreamUrl: String? = null,
     )
     /**
      * Custom player response intended to use for playback.
@@ -379,6 +381,34 @@ object YTPlayerUtils {
         if (isUploadedTrack) {
             println("[PLAYBACK_DEBUG] SUCCESS: Got playback data for uploaded track - format=${format.mimeType}, streamUrl=${streamUrl?.take(100)}...")
         }
+
+        // Try to resolve a video stream URL from the same player response (non-fatal)
+        var resolvedVideoFormat: PlayerResponse.StreamingData.Format? = null
+        var resolvedVideoStreamUrl: String? = null
+        try {
+            val vFmt = findVideoFormat(streamPlayerResponse!!, maxHeight = 1080)
+            if (vFmt != null) {
+                var vUrl = findUrlOrNull(vFmt, videoId, streamPlayerResponse, skipNewPipe = wasOriginallyAgeRestricted)
+                if (vUrl != null) {
+                    try {
+                        val transformed = EjsNTransformSolver.transformNParamInUrl(vUrl)
+                        if (transformed != vUrl) vUrl = transformed
+                    } catch (e: Exception) {
+                        Timber.tag(logTag).d("Video n-transform failed (non-fatal): ${e.message}")
+                    }
+                    if (poToken?.streamingDataPoToken != null) {
+                        val sep = if ("?" in vUrl) "&" else "?"
+                        vUrl = "${vUrl}${sep}pot=${poToken.streamingDataPoToken}"
+                    }
+                    resolvedVideoFormat = vFmt
+                    resolvedVideoStreamUrl = vUrl
+                    Timber.tag(logTag).d("Video URL resolved: height=${vFmt.height}, mimeType=${vFmt.mimeType}")
+                }
+            }
+        } catch (e: Exception) {
+            Timber.tag(logTag).d("Video URL resolution failed (non-fatal): ${e.message}")
+        }
+
         PlaybackData(
             audioConfig,
             videoDetails,
@@ -386,11 +416,53 @@ object YTPlayerUtils {
             format,
             streamUrl,
             streamExpiresInSeconds,
+            videoFormat = resolvedVideoFormat,
+            videoStreamUrl = resolvedVideoStreamUrl,
         )
     }.onFailure { e ->
         println("[PLAYBACK_DEBUG] EXCEPTION during playback for videoId=$videoId: ${e::class.simpleName}: ${e.message}")
         e.printStackTrace()
     }
+    /**
+     * Fetches a video-only stream URL for the given videoId using ANDROID_VR_NO_AUTH,
+     * which returns direct video URLs without signatureCipher (no WebView deobfuscation needed).
+     * Returns null if no video stream is available.
+     */
+    suspend fun videoStreamUrlForPlayback(videoId: String): String? = runCatching {
+        Timber.tag(logTag).d("Fetching video stream URL for videoId: $videoId")
+        // Android clients return direct URLs (no signatureCipher), so no CipherDeobfuscator
+        // WebView is needed. Try multiple clients in order; use the first that gives a video format.
+        for (client in listOf(ANDROID_VR_1_61_48, ANDROID_VR_NO_AUTH, IOS)) {
+            val response = YouTube.player(videoId, null, client, null, null).getOrNull()
+            if (response == null) continue
+            if (response.playabilityStatus.status != "OK") {
+                Timber.tag(logTag).d("Video player response not OK for ${client.clientName}: ${response.playabilityStatus.status}")
+                continue
+            }
+            val vFmt = findVideoFormat(response, maxHeight = 720)
+            if (vFmt == null) {
+                Timber.tag(logTag).d("No video format found via ${client.clientName}")
+                continue
+            }
+            var vUrl = findUrlOrNull(vFmt, videoId, response, skipNewPipe = false)
+            if (vUrl == null) {
+                Timber.tag(logTag).d("Could not resolve video URL via ${client.clientName}")
+                continue
+            }
+            try {
+                val transformed = EjsNTransformSolver.transformNParamInUrl(vUrl)
+                if (transformed != vUrl) vUrl = transformed
+            } catch (e: Exception) {
+                Timber.tag(logTag).d("Video n-transform failed (non-fatal): ${e.message}")
+            }
+            Timber.tag(logTag).d("Video stream URL resolved for $videoId via ${client.clientName}: height=${vFmt.height}, mimeType=${vFmt.mimeType}")
+            return@runCatching vUrl
+        }
+        Timber.tag(logTag).d("All clients failed to produce a video URL for $videoId")
+        null
+    }.onFailure { Timber.tag(logTag).e(it, "Failed to get video stream URL for $videoId") }
+        .getOrNull()
+
     /**
      * Simple player response intended to use for metadata only.
      * Stream URLs of this response might not work so don't use them.
@@ -429,6 +501,31 @@ object YTPlayerUtils {
         }
 
         return format
+    }
+
+    private fun findVideoFormat(
+        playerResponse: PlayerResponse,
+        maxHeight: Int = 1080,
+    ): PlayerResponse.StreamingData.Format? {
+        val adaptiveFormats = playerResponse.streamingData?.adaptiveFormats
+            ?.filter { !it.isAudio && (it.height ?: 0) <= maxHeight && it.height != null }
+            ?: emptyList()
+        // Strictly prefer H.264 (avc1) for maximum device compatibility.
+        // video/mp4 also includes AV1-in-MP4 (av01) which crashes many devices/emulators.
+        val adaptiveResult =
+            adaptiveFormats.filter { it.mimeType.contains("avc1", ignoreCase = true) }.maxByOrNull { it.height ?: 0 }
+                ?: adaptiveFormats.filter { it.mimeType.startsWith("video/mp4") && !it.mimeType.contains("av01", ignoreCase = true) }.maxByOrNull { it.height ?: 0 }
+                ?: adaptiveFormats.filter { it.mimeType.startsWith("video/mp4") }.maxByOrNull { it.height ?: 0 }
+                ?: adaptiveFormats.maxByOrNull { it.height ?: 0 }
+        if (adaptiveResult != null) return adaptiveResult
+        // Fall back to muxed (combined audio+video) formats — common for "official audio" tracks
+        // that have no separate video-only adaptive streams. The video player has audio disabled
+        // so only the video track will render.
+        val muxedFormats = playerResponse.streamingData?.formats
+            ?.filter { (it.height ?: 0) <= maxHeight && it.height != null }
+            ?: return null
+        return muxedFormats.filter { it.mimeType.contains("avc1", ignoreCase = true) }.maxByOrNull { it.height ?: 0 }
+            ?: muxedFormats.maxByOrNull { it.height ?: 0 }
     }
     /**
      * Checks if the stream url returns a successful status.

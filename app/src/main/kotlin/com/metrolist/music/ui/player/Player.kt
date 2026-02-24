@@ -269,6 +269,7 @@ fun BottomSheetPlayer(
     val canSkipPrevious by playerConnection.canSkipPrevious.collectAsState()
     val canSkipNext by playerConnection.canSkipNext.collectAsState()
     val isMuted by playerConnection.isMuted.collectAsState()
+    val videoModeEnabled by playerConnection.videoModeEnabled.collectAsState()
 
     val sliderStyle by rememberEnumPreference(SliderStyleKey, SliderStyle.DEFAULT)
     val squigglySlider by rememberPreference(SquigglySliderKey, defaultValue = false)
@@ -1547,70 +1548,87 @@ fun BottomSheetPlayer(
 
         when (LocalConfiguration.current.orientation) {
             Configuration.ORIENTATION_LANDSCAPE -> {
-                // Calculate vertical padding like OuterTune
-                val density = LocalDensity.current
-                val verticalPadding = max(
-                    WindowInsets.systemBars.getTop(density),
-                    WindowInsets.systemBars.getBottom(density)
-                )
-                val verticalPaddingDp = with(density) { verticalPadding.toDp() }
-                val verticalWindowInsets = WindowInsets(left = 0.dp, top = verticalPaddingDp, right = 0.dp, bottom = verticalPaddingDp)
-                
-                Row(
-                    modifier = Modifier
-                        .windowInsetsPadding(
-                            WindowInsets.systemBars.only(WindowInsetsSides.Horizontal).add(verticalWindowInsets)
-                        )
-                        .padding(bottom = 24.dp)
-                        .fillMaxSize()
-                ) {
+                val currentSliderPosition by rememberUpdatedState(sliderPosition)
+                val sliderPositionProvider = remember { { currentSliderPosition } }
+                val isExpandedProvider = remember(state) { { state.isExpanded } }
+
+                if (videoModeEnabled) {
+                    // Fullscreen video — hide controls while in landscape
                     Box(
-                        contentAlignment = Alignment.Center,
                         modifier = Modifier
-                            .weight(1f)
-                            .nestedScroll(state.preUpPostDownNestedScrollConnection)
+                            .fillMaxSize()
+                            .windowInsetsPadding(WindowInsets.systemBars)
                     ) {
-                        // Remember lambdas to prevent unnecessary recomposition
-                        val currentSliderPosition by rememberUpdatedState(sliderPosition)
-                        val sliderPositionProvider = remember { { currentSliderPosition } }
-                        val isExpandedProvider = remember(state) { { state.isExpanded } }
-                        AnimatedContent(
-                            targetState = showInlineLyrics,
-                            label = "Lyrics",
-                            transitionSpec = { fadeIn() togetherWith fadeOut() }
-                        ) { showLyrics ->
-                            if (showLyrics) {
-                                InlineLyricsView(
-                                    mediaMetadata = mediaMetadata,
-                                    showLyrics = showLyrics,
-                                    positionProvider = { effectivePosition }
-                                )
-                            } else {
-                                Thumbnail(
-                                    sliderPositionProvider = sliderPositionProvider,
-                                    modifier = Modifier.animateContentSize(),
-                                    isPlayerExpanded = isExpandedProvider,
-                                    isLandscape = true,
-                                    isListenTogetherGuest = isListenTogetherGuest
-                                )
+                        Thumbnail(
+                            sliderPositionProvider = sliderPositionProvider,
+                            modifier = Modifier.fillMaxSize(),
+                            isPlayerExpanded = isExpandedProvider,
+                            isLandscape = true,
+                            isListenTogetherGuest = isListenTogetherGuest
+                        )
+                    }
+                } else {
+                    // Calculate vertical padding like OuterTune
+                    val density = LocalDensity.current
+                    val verticalPadding = max(
+                        WindowInsets.systemBars.getTop(density),
+                        WindowInsets.systemBars.getBottom(density)
+                    )
+                    val verticalPaddingDp = with(density) { verticalPadding.toDp() }
+                    val verticalWindowInsets = WindowInsets(left = 0.dp, top = verticalPaddingDp, right = 0.dp, bottom = verticalPaddingDp)
+
+                    Row(
+                        modifier = Modifier
+                            .windowInsetsPadding(
+                                WindowInsets.systemBars.only(WindowInsetsSides.Horizontal).add(verticalWindowInsets)
+                            )
+                            .padding(bottom = 24.dp)
+                            .fillMaxSize()
+                    ) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .weight(1f)
+                                .nestedScroll(state.preUpPostDownNestedScrollConnection)
+                        ) {
+                            AnimatedContent(
+                                targetState = showInlineLyrics,
+                                label = "Lyrics",
+                                transitionSpec = { fadeIn() togetherWith fadeOut() }
+                            ) { showLyrics ->
+                                if (showLyrics) {
+                                    InlineLyricsView(
+                                        mediaMetadata = mediaMetadata,
+                                        showLyrics = showLyrics,
+                                        positionProvider = { effectivePosition }
+                                    )
+                                } else {
+                                    Thumbnail(
+                                        sliderPositionProvider = sliderPositionProvider,
+                                        modifier = Modifier.animateContentSize(),
+                                        isPlayerExpanded = isExpandedProvider,
+                                        isLandscape = true,
+                                        isListenTogetherGuest = isListenTogetherGuest
+                                    )
+                                }
                             }
                         }
-                    }
 
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier
-                            .weight(if (showInlineLyrics) 0.65f else 1f, false)
-                            .animateContentSize()
-                            .windowInsetsPadding(WindowInsets.systemBars.only(WindowInsetsSides.Top))
-                    ) {
-                        Spacer(Modifier.weight(1f))
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .weight(if (showInlineLyrics) 0.65f else 1f, false)
+                                .animateContentSize()
+                                .windowInsetsPadding(WindowInsets.systemBars.only(WindowInsetsSides.Top))
+                        ) {
+                            Spacer(Modifier.weight(1f))
 
-                        mediaMetadata?.let {
-                            controlsContent(it)
+                            mediaMetadata?.let {
+                                controlsContent(it)
+                            }
+
+                            Spacer(Modifier.weight(1f))
                         }
-
-                        Spacer(Modifier.weight(1f))
                     }
                 }
             }

@@ -31,9 +31,11 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
@@ -63,9 +65,14 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
+import android.graphics.SurfaceTexture
+import android.view.Surface
+import android.view.TextureView
 import coil3.compose.AsyncImage
 import coil3.request.CachePolicy
 import coil3.request.ImageRequest
@@ -212,6 +219,7 @@ fun Thumbnail(
     val queueTitle by playerConnection.queueTitle.collectAsState()
     val canSkipPrevious by playerConnection.canSkipPrevious.collectAsState()
     val canSkipNext by playerConnection.canSkipNext.collectAsState()
+    val videoModeEnabled by playerConnection.videoModeEnabled.collectAsState()
 
     // Preferences - computed once
     // Disable swipe for Listen Together guests
@@ -371,40 +379,121 @@ fun Thumbnail(
                     val isScrollEnabled by remember(swipeThumbnail) {
                         derivedStateOf { swipeThumbnail && isPlayerExpanded() }
                     }
-                    
-                    LazyHorizontalGrid(
-                        state = thumbnailLazyGridState,
-                        rows = GridCells.Fixed(1),
-                        flingBehavior = rememberSnapFlingBehavior(thumbnailSnapLayoutInfoProvider),
-                        userScrollEnabled = isScrollEnabled,
-                        modifier = if (isLandscape) {
-                            Modifier.size(dimensions.thumbnailSize + (PlayerHorizontalPadding * 2))
-                        } else {
-                            Modifier.fillMaxSize()
-                        }
-                    ) {
-                        items(
-                            items = mediaItems,
-                            key = { item -> 
-                                item.mediaId.ifEmpty { "unknown_${item.hashCode()}" }
+
+                    if (videoModeEnabled) {
+                        // Video mode: TextureView renders inline with Compose hierarchy
+                        // (SurfaceView is incompatible with CompositingStrategy.Offscreen)
+                        val surfaceHolder = remember { arrayOfNulls<Surface>(1) }
+                        val videoSizeState by playerConnection.videoSize.collectAsState()
+                        // In landscape fullscreen mode use the full BoxWithConstraints area;
+                        // in portrait use the square thumbnail container.
+                        val containerW = if (isLandscape) maxWidth else dimensions.thumbnailSize
+                        val containerH = if (isLandscape) maxHeight else dimensions.thumbnailSize
+                        // Compute width/height that fit inside the container while preserving
+                        // the video's native aspect ratio.
+                        val (videoViewWidth, videoViewHeight) = remember(videoSizeState, containerW, containerH) {
+                            val w = videoSizeState.width
+                            val h = videoSizeState.height
+                            if (w > 0 && h > 0) {
+                                val ratio = w.toFloat() / h.toFloat()
+                                val containerRatio = containerW.value / containerH.value
+                                if (ratio >= containerRatio) {
+                                    // Video is wider than container: fit by width
+                                    containerW to (containerW / ratio)
+                                } else {
+                                    // Video is taller than container: fit by height
+                                    (containerH * ratio) to containerH
+                                }
+                            } else {
+                                containerW to containerH
                             }
-                        ) { item ->
-                            ThumbnailItem(
-                                item = item,
-                                dimensions = dimensions,
-                                hidePlayerThumbnail = hidePlayerThumbnail,
-                                cropAlbumArt = cropAlbumArt,
-                                textBackgroundColor = textBackgroundColor,
-                                layoutDirection = layoutDirection,
-                                onSeek = onSeekCallback,
-                                playerConnection = playerConnection,
-                                context = context,
-                                isLandscape = isLandscape,
-                                isListenTogetherGuest = isListenTogetherGuest,
-                                currentMediaId = mediaMetadata?.id,
-                                currentMediaThumbnail = mediaMetadata?.thumbnailUrl
+                        }
+                        DisposableEffect(Unit) {
+                            onDispose {
+                                playerConnection.setVideoSurface(null)
+                                surfaceHolder[0]?.release()
+                                surfaceHolder[0] = null
+                            }
+                        }
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier.fillMaxSize()
+                        ) {
+                            AndroidView(
+                                factory = { ctx ->
+                                    TextureView(ctx).apply {
+                                        surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                                            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                                                val s = Surface(st)
+                                                surfaceHolder[0] = s
+                                                playerConnection.setVideoSurface(s)
+                                            }
+                                            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                                                playerConnection.setVideoSurface(null)
+                                                surfaceHolder[0] = null
+                                                return true
+                                            }
+                                            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+                                            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+                                        }
+                                    }
+                                },
+                                modifier = Modifier
+                                    .size(videoViewWidth, videoViewHeight)
+                                    .clip(RoundedCornerShape(dimensions.cornerRadius))
+                                    .background(Color.Black)
                             )
                         }
+                    } else {
+                        LazyHorizontalGrid(
+                            state = thumbnailLazyGridState,
+                            rows = GridCells.Fixed(1),
+                            flingBehavior = rememberSnapFlingBehavior(thumbnailSnapLayoutInfoProvider),
+                            userScrollEnabled = isScrollEnabled,
+                            modifier = if (isLandscape) {
+                                Modifier.size(dimensions.thumbnailSize + (PlayerHorizontalPadding * 2))
+                            } else {
+                                Modifier.fillMaxSize()
+                            }
+                        ) {
+                            items(
+                                items = mediaItems,
+                                key = { item ->
+                                    item.mediaId.ifEmpty { "unknown_${item.hashCode()}" }
+                                }
+                            ) { item ->
+                                ThumbnailItem(
+                                    item = item,
+                                    dimensions = dimensions,
+                                    hidePlayerThumbnail = hidePlayerThumbnail,
+                                    cropAlbumArt = cropAlbumArt,
+                                    textBackgroundColor = textBackgroundColor,
+                                    layoutDirection = layoutDirection,
+                                    onSeek = onSeekCallback,
+                                    playerConnection = playerConnection,
+                                    context = context,
+                                    isLandscape = isLandscape,
+                                    isListenTogetherGuest = isListenTogetherGuest,
+                                    currentMediaId = mediaMetadata?.id,
+                                    currentMediaThumbnail = mediaMetadata?.thumbnailUrl
+                                )
+                            }
+                        }
+                    }
+
+                    // Floating video mode toggle button
+                    IconButton(
+                        onClick = { playerConnection.toggleVideoMode() },
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(end = PlayerHorizontalPadding, bottom = 8.dp)
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.slow_motion_video),
+                            contentDescription = stringResource(R.string.music_video),
+                            tint = if (videoModeEnabled) MaterialTheme.colorScheme.primary
+                                   else textBackgroundColor.copy(alpha = 0.6f)
+                        )
                     }
                 }
             }

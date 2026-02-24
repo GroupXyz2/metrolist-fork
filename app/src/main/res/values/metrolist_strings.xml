@@ -14,6 +14,7 @@
     <string name="retry_button">Retry</string>
     <string name="album_cover_desc">Album cover</string>
     <string name="top_music_videos">Top music videos</string>
+    <string name="music_video">Music Video</string>
     <string name="trending">Trending</string>
     <string name="top_result">Top result</string>
     <string name="other_results">Other</string>
