@@ -327,8 +327,18 @@ fun rememberBottomSheetState(
     var previousAnchor by rememberSaveable {
         mutableIntStateOf(initialAnchor)
     }
+    // Start at the correct anchor position immediately so isDismissed/isCollapsed/isExpanded
+    // are correct from the very first frame. Without this, the animatable starts at 0.dp
+    // (dismissedBound), making isDismissed=true on Activity recreation (e.g. screen rotation),
+    // which causes LaunchedEffects that check isDismissed to incorrectly call collapseSoft()
+    // and collapse the player even though it was previously expanded.
     val animatable = remember {
-        Animatable(0.dp, Dp.VectorConverter)
+        val startValue = when (previousAnchor) {
+            expandedAnchor -> expandedBound
+            collapsedAnchor -> collapsedBound
+            else -> dismissedBound
+        }
+        Animatable(startValue, Dp.VectorConverter)
     }
 
     return remember(dismissedBound, expandedBound, collapsedBound, coroutineScope) {
