@@ -385,6 +385,9 @@ class MusicService :
     // In this mode the audio ExoPlayer is silenced and position sync is suspended.
     val videoOriginalAudioMode = MutableStateFlow(false)
 
+    // Duration (ms) of the muxed stream in original audio mode; C.TIME_UNSET when inactive.
+    val videoOriginalAudioDuration = MutableStateFlow(C.TIME_UNSET)
+
     // Tracks the YouTube video ID currently shown in video mode (may differ from song ID)
     private var currentVideoId: String? = null
 
@@ -3026,6 +3029,7 @@ class MusicService :
 
         val hadOriginalAudio = videoOriginalAudioMode.value
         videoOriginalAudioMode.value = false
+        videoOriginalAudioDuration.value = C.TIME_UNSET
         currentVideoId = null
 
         // Restore main player volume if it was muted by original audio mode
@@ -3103,6 +3107,7 @@ class MusicService :
         if (videoOriginalAudioMode.value) {
             // ── Turning OFF: restore normal muted video mode ─────────────────
             videoOriginalAudioMode.value = false
+            videoOriginalAudioDuration.value = C.TIME_UNSET
 
             // Restore main player volume
             player.volume = if (isMuted.value) 0f else playerVolume.value
@@ -3122,7 +3127,7 @@ class MusicService :
             enableVideoMode()
         } else {
             // ── Turning ON: mute main player, use muxed stream with audio ─────
-            val vp = videoPlayer ?: return
+            val vp = videoPlayer  // may be null if video mode wasn't active; handled below
             val videoId = currentVideoId ?: songId
             val wasPlaying = player.isPlaying
             val currentPosition = player.currentPosition
@@ -3151,13 +3156,21 @@ class MusicService :
                 videoSyncJob = null
                 videoSyncListener?.let { player.removeListener(it) }
                 videoSyncListener = null
-                vp.stop()
-                vp.release()
+                vp?.stop()
+                vp?.release()
                 videoPlayer = null
 
                 // Create a new video player with audio ENABLED (muxed stream has audio track)
                 val avp = createAudioVideoExoPlayer()
                 avp.addListener(object : Player.Listener {
+                    override fun onPlaybackStateChanged(state: Int) {
+                        if (state == Player.STATE_READY) {
+                            val d = avp.duration
+                            if (d != C.TIME_UNSET && d > 0) {
+                                videoOriginalAudioDuration.value = d
+                            }
+                        }
+                    }
                     override fun onVideoSizeChanged(size: VideoSize) {
                         videoSize.value = size
                     }

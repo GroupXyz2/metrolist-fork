@@ -513,6 +513,7 @@ class PlayerConnection(
 
     // Video original audio mode
     val videoOriginalAudioMode get() = service.videoOriginalAudioMode
+    val videoOriginalAudioDuration get() = service.videoOriginalAudioDuration
     fun toggleVideoOriginalAudio() = service.toggleVideoOriginalAudio()
 
     // ---- End Video Player Controls ------------------------------------------

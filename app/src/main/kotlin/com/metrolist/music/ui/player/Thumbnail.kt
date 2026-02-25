@@ -214,7 +214,6 @@ fun Thumbnail(
     isPlayerExpanded: () -> Boolean = { true },
     isLandscape: Boolean = false,
     isListenTogetherGuest: Boolean = false,
-    onVideoTap: (() -> Unit)? = null,
 ) {
     val playerConnection = LocalPlayerConnection.current ?: return
     val context = LocalContext.current
@@ -454,16 +453,6 @@ fun Thumbnail(
                                     .clip(RoundedCornerShape(dimensions.cornerRadius))
                                     .background(Color.Black)
                             )
-                            // Transparent overlay to intercept taps for fullscreen toggle
-                            if (onVideoTap != null) {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .pointerInput(onVideoTap) {
-                                            detectTapGestures { onVideoTap() }
-                                        }
-                                )
-                            }
                         }
                     } else {
                         LazyHorizontalGrid(

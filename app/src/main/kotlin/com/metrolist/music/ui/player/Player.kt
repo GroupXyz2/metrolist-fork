@@ -10,8 +10,6 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
-import android.app.Activity
-import android.content.pm.ActivityInfo
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.compose.animation.AnimatedContent
@@ -272,6 +270,8 @@ fun BottomSheetPlayer(
     val canSkipNext by playerConnection.canSkipNext.collectAsState()
     val isMuted by playerConnection.isMuted.collectAsState()
     val videoModeEnabled by playerConnection.videoModeEnabled.collectAsState()
+    val videoOriginalAudioMode by playerConnection.videoOriginalAudioMode.collectAsState()
+    val videoOriginalAudioDuration by playerConnection.videoOriginalAudioDuration.collectAsState()
 
     val sliderStyle by rememberEnumPreference(SliderStyleKey, SliderStyle.DEFAULT)
     val squigglySlider by rememberPreference(SquigglySliderKey, defaultValue = false)
@@ -570,24 +570,6 @@ fun BottomSheetPlayer(
         mutableStateOf(false)
     }
 
-    // Tracks whether we've programmatically locked the orientation to landscape for video fullscreen
-    var videoLandscapeLocked by rememberSaveable { mutableStateOf(false) }
-    val activity = LocalContext.current as? Activity
-
-    // Apply/remove orientation lock when user taps the video
-    LaunchedEffect(videoLandscapeLocked) {
-        activity?.requestedOrientation = if (videoLandscapeLocked)
-            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        else
-            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-    }
-    // Release lock automatically when video mode is turned off
-    LaunchedEffect(videoModeEnabled) {
-        if (!videoModeEnabled && videoLandscapeLocked) {
-            videoLandscapeLocked = false
-        }
-    }
-
     // Position update - only for local playback
     // When casting, we use castPosition directly to avoid sync issues
     // Use isPlaying instead of playbackState to ensure continuous updates during playback
@@ -597,17 +579,25 @@ fun BottomSheetPlayer(
                 delay(100) // Update more frequently for smoother progress bar
                 if (sliderPosition == null) { // Only update if user isn't dragging
                     position = playerConnection.player.currentPosition
-                    duration = playerConnection.player.duration
+                    duration = if (videoOriginalAudioMode && videoOriginalAudioDuration != C.TIME_UNSET) {
+                        videoOriginalAudioDuration
+                    } else {
+                        playerConnection.player.duration
+                    }
                 }
             }
         }
     }
-    
+
     // Also update position when playback state changes (e.g., song change, seek)
-    LaunchedEffect(playbackState, mediaMetadata?.id) {
+    LaunchedEffect(playbackState, mediaMetadata?.id, videoOriginalAudioDuration) {
         if (!isCasting) {
             position = playerConnection.player.currentPosition
-            duration = playerConnection.player.duration
+            duration = if (videoOriginalAudioMode && videoOriginalAudioDuration != C.TIME_UNSET) {
+                videoOriginalAudioDuration
+            } else {
+                playerConnection.player.duration
+            }
         }
     }
     
@@ -1584,8 +1574,7 @@ fun BottomSheetPlayer(
                             modifier = Modifier.fillMaxSize(),
                             isPlayerExpanded = isExpandedProvider,
                             isLandscape = true,
-                            isListenTogetherGuest = isListenTogetherGuest,
-                            onVideoTap = { videoLandscapeLocked = !videoLandscapeLocked }
+                            isListenTogetherGuest = isListenTogetherGuest
                         )
                     }
                 } else {
@@ -1629,8 +1618,7 @@ fun BottomSheetPlayer(
                                         modifier = Modifier.animateContentSize(),
                                         isPlayerExpanded = isExpandedProvider,
                                         isLandscape = true,
-                                        isListenTogetherGuest = isListenTogetherGuest,
-                                        onVideoTap = { videoLandscapeLocked = !videoLandscapeLocked }
+                                        isListenTogetherGuest = isListenTogetherGuest
                                     )
                                 }
                             }
@@ -1692,8 +1680,7 @@ fun BottomSheetPlayer(
                                     sliderPositionProvider = sliderPositionProvider,
                                     modifier = Modifier.nestedScroll(state.preUpPostDownNestedScrollConnection),
                                     isPlayerExpanded = isExpandedProvider,
-                                    isListenTogetherGuest = isListenTogetherGuest,
-                                    onVideoTap = { videoLandscapeLocked = !videoLandscapeLocked }
+                                    isListenTogetherGuest = isListenTogetherGuest
                                 )
                             }
                         }
