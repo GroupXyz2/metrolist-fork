@@ -3032,10 +3032,11 @@ class MusicService :
         videoOriginalAudioDuration.value = C.TIME_UNSET
         currentVideoId = null
 
-        // Restore main player volume if it was muted by original audio mode
-        if (hadOriginalAudio) {
-            player.volume = if (isMuted.value) 0f else playerVolume.value
-        }
+        // Always restore main player volume when disabling video mode.
+        // This is safe even if original audio was never active (it just re-applies the same value)
+        // and also handles the race window where player.volume=0f was set before
+        // videoOriginalAudioMode.value=true was written.
+        player.volume = if (isMuted.value) 0f else playerVolume.value
 
         // Re-prepare the main player so it returns to the normal song stream.
         // Skip during song transitions (restoreStream = false) since the player
@@ -3176,6 +3177,10 @@ class MusicService :
                     }
                     override fun onPlayerError(error: PlaybackException) {
                         Timber.tag(TAG).e("Audio+video player error: ${error.message}")
+                        // Muxed player failed — restore main player audio so the user isn't left in silence
+                        videoOriginalAudioMode.value = false
+                        videoOriginalAudioDuration.value = C.TIME_UNSET
+                        player.volume = if (isMuted.value) 0f else playerVolume.value
                     }
                 })
                 videoPlayer = avp
