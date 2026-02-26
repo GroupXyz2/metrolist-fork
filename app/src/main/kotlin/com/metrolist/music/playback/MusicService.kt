@@ -564,7 +564,9 @@ class MusicService :
         audioManager.registerAudioDeviceCallback(audioDeviceCallback, null)
 
         audioQuality = dataStore.get(AudioQualityKey).toEnum(com.metrolist.music.constants.AudioQuality.AUTO)
-        playerVolume = MutableStateFlow(dataStore.get(PlayerVolumeKey, 1f).coerceIn(0f, 1f))
+        // Ensure volume is never 0f on startup
+        val savedVolume = dataStore.get(PlayerVolumeKey, 1f).coerceIn(0f, 1f)
+        playerVolume = MutableStateFlow(if (savedVolume <= 0f) 1f else savedVolume)
 
         // Initialize Google Cast
         initializeCast()
@@ -926,7 +928,9 @@ class MusicService :
                         // Don't restore repeat/shuffle from playerState as they are already set from DataStore (source of truth)
                         // player.repeatMode = playerState.repeatMode
                         // player.shuffleModeEnabled = playerState.shuffleModeEnabled
-                        playerVolume.value = playerState.volume
+                        // Guard: never restore a 0f volume — this could have been saved while
+                        // video original audio mode was active (player.volume was 0f at that time).
+                        playerVolume.value = if (playerState.volume <= 0f) 1f else playerState.volume
 
                         // Restore position if it's still valid
                         if (playerState.currentMediaItemIndex < player.mediaItemCount) {
@@ -3170,6 +3174,24 @@ class MusicService :
                             if (d != C.TIME_UNSET && d > 0) {
                                 videoOriginalAudioDuration.value = d
                             }
+                        } else if (state == Player.STATE_ENDED) {
+                            // Muxed video/audio stream ended. Advance the main player to the
+                            // next song so playback continues without silence.
+                            val songIdWhenEnded = currentMediaMetadata.value?.id
+                            scope.launch(Dispatchers.Main) {
+                                if (videoOriginalAudioMode.value &&
+                                    currentMediaMetadata.value?.id == songIdWhenEnded
+                                ) {
+                                    if (player.hasNextMediaItem()) {
+                                        player.seekToNextMediaItem()
+                                    } else {
+                                        // No next item — restore main player audio to prevent silence
+                                        videoOriginalAudioMode.value = false
+                                        videoOriginalAudioDuration.value = C.TIME_UNSET
+                                        player.volume = if (isMuted.value) 0f else playerVolume.value
+                                    }
+                                }
+                            }
                         }
                     }
                     override fun onVideoSizeChanged(size: VideoSize) {
@@ -3435,12 +3457,14 @@ class MusicService :
                     position = 0,
                 )
 
-            // Save player state
+            // Save player state.
+            // Use playerVolume.value (the logical/user-set volume)
+            val persistedVolume = playerVolume.value.let { if (it <= 0f) 1f else it }
             val persistPlayerState = PersistPlayerState(
                 playWhenReady = player.playWhenReady,
                 repeatMode = player.repeatMode,
                 shuffleModeEnabled = player.shuffleModeEnabled,
-                volume = player.volume,
+                volume = persistedVolume,
                 currentPosition = player.currentPosition,
                 currentMediaItemIndex = player.currentMediaItemIndex,
                 playbackState = player.playbackState
